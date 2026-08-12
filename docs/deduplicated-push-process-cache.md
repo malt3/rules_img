@@ -57,6 +57,56 @@ others should mount from (and co-upload to).
 Mounts still never cross registries — every decision stays inside one registry, as
 today.
 
+### Concurrency contract: single lock, get-or-insert
+
+The cache exposes a simple, lock-scoped get-or-insert API so all goroutines resolve
+the same blob key consistently:
+
+```go
+type CacheState int
+const (
+    CacheDone CacheState = iota
+    CacheInFlight
+)
+
+type ResolveResult struct {
+    Home  string
+    State CacheState // done or in-flight
+}
+
+// mu is acquired at function entry and released only on return.
+ResolveOrInsert(key BlobKey, candidateHome string) ResolveResult
+```
+
+`ResolveOrInsert` behavior under the same mutex lock:
+
+1. If `key` is in `present`, return `{home: present[key], state: done}`.
+2. Else if `key` is in `inflight`, return `{home: inflight[key], state: in-flight}`.
+3. Else insert `inflight[key] = candidateHome` and return
+   `{home: candidateHome, state: in-flight}`.
+
+This is intentionally one critical section (lock held for the full decision), which
+guarantees that concurrent goroutines never create two different in-flight homes for
+the same `(registry, digest)`.
+
+### Concurrency contract: atomic promote
+
+Promotion from in-flight to done is also one lock-scoped operation:
+
+```go
+// mu is acquired at function entry and released only on return.
+PromoteToDone(key BlobKey, home string)
+```
+
+Under lock:
+
+1. `present[key] = home`
+2. `delete(inflight, key)`
+
+No other goroutine can observe an intermediate state where the key is in neither map
+after successful upload promotion, or where it remains in-flight after being marked
+done.
+
 ## Inflight: co-upload, do not wait
 
 Seeing an `inflight` entry must **not** block on another request finishing.
@@ -85,14 +135,17 @@ do not apply.
 For each needed `(registry, digest)` among opted-in push / `registry_tag` operations:
 
 1. **`present` hit** → mount from that home; do **not** enqueue an upload.
-2. **`inflight` hit** → mount from that home; **enqueue upload** to the same home in
-   this request’s upload phase (ggcr coalesces with peers).
+2. **`inflight` hit** (state returned by `ResolveOrInsert`) → mount from that home;
+   **enqueue upload** to the same home in this request’s upload phase (ggcr
+   coalesces with peers).
 3. **Else claim** → home = first destination in this request that needs the blob
-   (“first repo that comes along”); insert `inflight[reg,digest]=home`; enqueue
-   upload to home; other destinations in this request mount from home.
+   (“first repo that comes along”); `ResolveOrInsert` inserts
+   `inflight[reg,digest]=home` and returns state `in-flight`; enqueue upload to home;
+   other destinations in this request mount from home.
 
-After this request’s uploads succeed, write `present` and clear `inflight` for those
-digests so later requests can skip the upload enqueue entirely.
+After this request’s uploads succeed, atomically promote each key via
+`PromoteToDone`: write `present` and clear `inflight` in one lock-scoped operation
+so later requests can skip the upload enqueue entirely.
 
 If a claim’s upload fails: remove `inflight` (if this request still owns the claim
 and nothing else promoted it) and fail the request as today. A peer that co-uploaded
