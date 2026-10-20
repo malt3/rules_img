@@ -8,11 +8,16 @@ def _encode_platforms(platforms):
     return ",".join([str(platform) for platform in platforms])
 
 def _encode_platforms_if_different(settings, input_platforms):
+    # Preserve the outer platform across nested transitions, including an
+    # incoming manifest transition that already has the requested platform.
+    original_platforms = settings[_original_platforms_setting]
+    if original_platforms:
+        return original_platforms
     before = _encode_platforms(settings[_platforms_setting])
     after = _encode_platforms([input_platforms])
     if before == after:
         return ""
-    return after
+    return before
 
 def _decode_original_patforms(settings):
     maybe_original_platforms = settings[_original_platforms_setting]
@@ -34,7 +39,7 @@ def _multi_platform_image_transition_impl(settings, attr):
 
 multi_platform_image_transition = transition(
     implementation = _multi_platform_image_transition_impl,
-    inputs = [_platforms_setting],
+    inputs = [_platforms_setting, _original_platforms_setting],
     outputs = [
         _platforms_setting,
         _original_platforms_setting,
@@ -89,7 +94,7 @@ def _single_platform_transition_impl(settings, attr):
 
 single_platform_transition = transition(
     implementation = _single_platform_transition_impl,
-    inputs = [_platforms_setting],
+    inputs = [_platforms_setting, _original_platforms_setting],
     outputs = [
         _platforms_setting,
         _original_platforms_setting,
